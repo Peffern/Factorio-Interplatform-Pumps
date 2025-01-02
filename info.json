@@ -1,0 +1,9 @@
+{
+  "name": "rockets-test",
+  "version": "0.1.0",
+  "title": "Rockets Test",
+  "author": "peffern",
+  "factorio_version": "2.0",
+  "dependencies": ["base >= 2.0"],
+  "description": "Testing some stuff with rocket silos."
+}
