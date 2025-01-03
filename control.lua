@@ -23,8 +23,11 @@ function setup()
         storage.exporter_states[i - 1] = {}
         storage.importer_states[i - 1] = {}
     end
-end
 
+    -- reverse lookup to see what platforms are at what orbit on what planets
+    -- index by surface (planet?) -> orbit # -> list of platform unit #s.
+    storage.space_location_lookups = {}
+end
 
 -- callback for when any assembler is built
 function assembler_built(event) 
@@ -186,7 +189,8 @@ function on_gui_change(event)
 
         if not (storage.platform_orbit_states[unit_number % shard_count][unit_number]) then
             storage.platform_orbit_states[unit_number % shard_count][unit_number] = {
-                -- TODO initialize other values here, gather into a standard constructor fn, etc.
+                -- initialize platform orbit state for this platform
+                entity = player.opened
             }
         end
 
@@ -204,13 +208,67 @@ function on_gui_change(event)
         
         if not (storage[storage_key][unit_number % shard_count][unit_number]) then
             storage[storage_key][unit_number % shard_count][unit_number] = {
-                -- TODO initialize other values here, gather into a standard constructor fn, etc.
+                -- initialize importer/exporter state for this entity
+                entity = player.opened
             }
         end
 
         -- since it's a signal button, elem_value will be the signal data and we can store it directly in the table
         storage[storage_key][unit_number % shard_count][unit_number].port_id_signal = event.element.elem_value
     
+    end
+end
+
+-- general on tick handler.
+function tick_handler(event)
+    local shard = event.tick % shard_count -- which slice of machines are we processing on this tick
+
+    -- platform orbit stuff
+    -- any platforms that we dont know about cant have an orbit signal set. therefore they cant change their orbit
+    -- therefore they cant link and transfer items/fludis so we dont care about them and can skip.
+
+    -- iterate over the ones we do know about
+
+    for unit_number, platform_state in pairs(storage.platform_orbit_states[shard]) do
+        local entity = platform_state.entity -- get the platform hub entity for this entry
+        local platform = entity.surface.platform
+
+        if platform and platform.state == defines.space_platform_state.waiting_at_station then
+            local signal_value = 0 -- treat no signal like 0. you have to keep the signal for the whole time you're in transit if you want to get anywhere.
+            local destination_signal = platform_state.orbit_destination_signal
+            if destination_signal then
+                -- destination signal is something like {type="item",name="thruster"}.
+                -- check the value of this signal
+                local circuit_network = entity.get_circuit_network(defines.wire_connector_id.circuit_red)
+                if not circuit_network then circuit_network = entity.get_circuit_network(defines.wire_connector_id.circuit_green) end
+                
+
+                if circuit_network then
+                    signal_value = circuit_network.get_signal(destination_signal)
+                end
+            end
+
+            local space_location = platform.space_location.name
+            if not storage.space_location_lookups[space_location] then storage.space_location_lookups[space_location] = {} end -- create if not exists
+
+            
+            -- first special case. if you ever don't have a destination or whatever, all progress is erased and you go to 0/"high" orbit.
+            if signal_value == 0 then
+                -- TODO decrement
+                storage.platform_orbit_states[shard][unit_number].current_orbit_number = 0
+                storage.platform_orbit_states[shard][unit_number].orbit_transit_progress = 0
+            elseif signal_value ~= platform_state.current_orbit_number then
+            -- now read current orbit location and progress from state.
+            -- if current == signal_value then we are there or en route.
+            -- we dont do progress updates here, that happens in the jet handler.
+            -- enough to mark it as current destination/location.
+            -- in order to do that it has to be free.
+            -- TODO actually do this
+            end
+        end
+
+
+        
     end
 end
 
@@ -228,6 +286,8 @@ script.on_event(defines.events.on_gui_closed, on_gui_close)
 script.on_event(defines.events.on_gui_elem_changed, on_gui_change)
 script.on_event(defines.events.on_gui_selection_state_changed, on_gui_change) 
 
+script.on_event(defines.events.on_tick, tick_handler)
+
 script.on_init(setup)
 
 -- everything should be in place
@@ -242,11 +302,36 @@ script.on_init(setup)
     i.e. make sure we dont have 2 already there or in transit. then set us in transit and set progress to 0.
         
     also handle cancels, i.e. if it does match and we arent stopped, then stop.
-    TODO handle case where we turn around but someone took our spot. do we hold both? do we swap the progress bar around?
+    handle case where we turn around but someone took our spot. do we hold both? do we swap the progress bar around?
+    the solution for this is that if you are waiting you are always in the 0 orbit.
+    you can be in one of the following states:
+    - 0 orbit (idle)
+    - N orbit (idle / maybe linked and transferring)
+    - traveling to N orbit (this counts as N for the 2 limit)
+    - waiting to travel to N orbit (this counts as 0).
+    
+    the key is that 0 isnt an orbit and so going to it is free. 1->0->2 is the same as 1->2 in terms of fuel cost.
+    so every tick we read the signal.
+    if 0 go instantly to 0 and idle.
+    if some N (N!= 0) and we are idle at N do nothing.
+    if N and we are en route to N do nothing.
+    if N and we are at 0
+        if N is open then go to traveling-to-N state (0% progress)
+        if N is closed then stay at 0 and go to waiting-for-N state.
+    if N and we are at some M (N != M, M!= 0)
+        if M is open then go to traveling-to-N state (0% progress)
+        if N is closed then go instantly to 0 and go to waiting-for-N state.
+   if N and we are en route to M
+        if N is open then go to traveling-to-N state (reset progress to 0% progress)
+        if N is closed then go instantly to 0 and go to waiting-for-N state (lose progress).
+        
+    this setup means that if we try to change dests and get stuck we drop back to 0. 
+    in fact, we dont even need a waiting state, since by definition we can have as many as we want and waiting
 
     for thrusters, if were currently in transit then try to do a tick.
     that means, drain fuel + oxidizer and and tick up the progress bar.
-    include completion, if it fills then we go to stopped and not in transit any more.
+    include completion, if it fills then we go to stopped and not in transit an
+    y more.
 
     
     everything else assumes we're stopped. if we're in transit or waiting, then we dont do anything here.
@@ -265,7 +350,7 @@ script.on_init(setup)
     if it doesnt, look in front of it for palletizer and in front of us for depalletizer.
     if all found, move some.
 
-    todo better linking with linked inventories.
+    todo investigate linked inventories / fluidboxes and see if there's a better way
     
 
 ]]
